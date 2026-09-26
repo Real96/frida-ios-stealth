@@ -24,7 +24,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 150
+    # two full frida compiles (vanilla + stealth), so allow more headroom
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,12 +82,23 @@ jobs:
           tag="v${ver}"
           notes="release-notes.md"
           {
-            echo "Anti-detect frida-server for iOS - roothide Dopamine, rootless, arm64e."
+            echo "frida-server for iOS - roothide Dopamine / rootless, arm64e (fat arm64+arm64e)."
+            echo "Each release carries two flavors, each in two packagings."
             echo
             echo "- frida version: \`${ver}\`"
             echo "- built: $(date -u +%FT%TZ) in GitHub Actions (macos-14)"
             echo
-            echo "## Applied / skipped Florida patches"
+            echo "### Assets"
+            echo "| file | flavor | jailbreak layout |"
+            echo "|---|---|---|"
+            echo "| \`frida_${ver}_iphoneos-arm64e-roothide.deb\` | stealth (anti-detect) | roothide (jbroot) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e.deb\` | stealth (anti-detect) | rootless (\`/var/jb\`) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e-roothide-vanilla.deb\` | vanilla (upstream) | roothide (jbroot) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e-vanilla.deb\` | vanilla (upstream) | rootless (\`/var/jb\`) |"
+            echo
+            echo "Vanilla = pristine upstream frida, no patches. Stealth = Florida + iOS anti-detect patches."
+            echo
+            echo "## Applied / skipped anti-detect patches (stealth builds only)"
             echo '```'
             cat patch-report.txt 2>/dev/null || echo "no patch report"
             echo '```'
@@ -96,7 +108,7 @@ jobs:
             gh release edit "$tag" --notes-file "$notes" --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" out/*.deb \
-              --title "frida-server stealth ${ver} (rootless arm64e)" \
+              --title "frida-server ${ver} (stealth + vanilla, arm64e)" \
               --notes-file "$notes" \
               --repo "$GITHUB_REPOSITORY"
           fi

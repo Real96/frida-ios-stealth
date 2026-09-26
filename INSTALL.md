@@ -1,14 +1,51 @@
 # Install (roothide Dopamine and plain rootless)
 
-The release ships two packages, both `iphoneos-arm64e`, both fat arm64+arm64e:
+The release ships **four** packages, all `iphoneos-arm64e`, all fat arm64+arm64e.
+Two axes: **flavor** (stealth vs vanilla) and **jailbreak layout** (roothide vs
+plain rootless).
 
-| file | for |
-|---|---|
-| `frida_<ver>_iphoneos-arm64e-roothide.deb` | **roothide Dopamine** (randomized jbroot, no `/var/jb`) |
-| `frida_<ver>_iphoneos-arm64e.deb` | plain rootless Dopamine / Xina etc. (fixed `/var/jb`) |
+| file | flavor | for |
+|---|---|---|
+| `frida_<ver>_iphoneos-arm64e-roothide.deb` | stealth (anti-detect) | **roothide Dopamine** (randomized jbroot, no `/var/jb`) |
+| `frida_<ver>_iphoneos-arm64e.deb` | stealth (anti-detect) | plain rootless Dopamine / Xina etc. (fixed `/var/jb`) |
+| `frida_<ver>_iphoneos-arm64e-roothide-vanilla.deb` | vanilla (upstream) | **roothide Dopamine** |
+| `frida_<ver>_iphoneos-arm64e-vanilla.deb` | vanilla (upstream) | plain rootless Dopamine / Xina etc. |
 
-Pick the one that matches your jailbreak. `dpkg -i` the wrong one and the daemon
-paths will not resolve.
+Pick the **one** that matches your jailbreak and the flavor you want. `dpkg -i`
+the wrong layout and the daemon paths will not resolve.
+
+## stealth vs vanilla
+
+Same frida, same version; the only difference is whether the anti-detect source
+patches were compiled in.
+
+- **stealth** - Florida + this repo's iOS patches applied. Spoofs the process
+  name and strips the plaintext `frida:rpc` literal (see "What is and is not
+  hidden" below). Use against apps with jailbreak / Frida detection.
+- **vanilla** - pristine upstream frida, no patches. Simplest and closest to
+  what `frida --version` on your host expects. Use when the target has no
+  anti-tampering, or when you want a known-clean baseline.
+
+## roothide layout vs rootless (`/var/jb`) layout
+
+The `-roothide` and non-`-roothide` packages hold the **same frida-server /
+frida-agent binary**. They differ only in how the `.deb` is laid out and how the
+daemon is loaded:
+
+- **rootless (`frida_<ver>_iphoneos-arm64e.deb`)** - files live under `/var/jb`
+  (`/var/jb/usr/sbin/frida-server`, ...). The daemon plist hardcodes `/var/jb`
+  paths and the maintainer scripts call `launchctl load /var/jb/...` directly.
+  This works on jailbreaks that expose a **fixed** `/var/jb` symlink (plain
+  rootless Dopamine, Xina, palera1n rootless).
+- **roothide (`frida_<ver>_iphoneos-arm64e-roothide.deb`)** - roothide has **no**
+  `/var/jb`; its jailbreak root is a **randomized** path. So this package uses a
+  rootful layout (`/usr/sbin`, `/Library/LaunchDaemons`, no `/var/jb`); roothide's
+  `dpkg` relocates those into the randomized jbroot automatically. The plist uses
+  jbroot-based paths and the maintainer scripts resolve the real path with
+  roothide's `jbroot` command before calling `launchctl`.
+
+Install the rootless deb on roothide and the `/var/jb/...` paths simply do not
+exist, so the daemon never comes up - hence the two packages.
 
 ---
 
@@ -19,7 +56,8 @@ package uses a rootful layout and `dpkg` relocates it into jbroot automatically.
 
 ```sh
 # on device (Sileo -> import, or over SSH into the bootstrap):
-dpkg -i frida_17.17.0_iphoneos-arm64e-roothide.deb
+dpkg -i frida_<ver>_iphoneos-arm64e-roothide.deb
+# vanilla instead: dpkg -i frida_<ver>_iphoneos-arm64e-roothide-vanilla.deb
 ```
 
 The `extrainst_` script resolves the real path with the roothide `jbroot`
@@ -65,7 +103,8 @@ launchctl bootstrap system "$plist" 2>/dev/null || launchctl load  "$plist"
 ## Plain rootless Dopamine (`/var/jb`)
 
 ```sh
-dpkg -i frida_17.17.0_iphoneos-arm64e.deb
+dpkg -i frida_<ver>_iphoneos-arm64e.deb
+# vanilla instead: dpkg -i frida_<ver>_iphoneos-arm64e-vanilla.deb
 launchctl reload /var/jb/Library/LaunchDaemons/re.frida.server.plist \
   || launchctl load /var/jb/Library/LaunchDaemons/re.frida.server.plist
 ```
@@ -104,7 +143,10 @@ Rename the binary IN PLACE (keep it in the same dir so the agent at
 `Label` / `Program` / `ProgramArguments[0]` at the new name. Keep
 `frida-agent.dylib` where it is - moving it out or deleting it breaks injection.
 
-## What is and is not hidden
+## What is and is not hidden (stealth flavor)
+
+This section applies to the **stealth** debs only; the **vanilla** debs have none
+of these edits.
 
 Applied anti-detect (real effect on the iOS binary):
 
