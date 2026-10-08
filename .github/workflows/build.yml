@@ -24,7 +24,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 150
+    # two full frida compiles (vanilla + stealth), so allow more headroom
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,11 +47,51 @@ jobs:
           echo "py:   $(python3 --version 2>/dev/null)"
           echo "gmake: $(gmake --version 2>/dev/null | head -1)"
 
-      - name: Build frida-server (iOS rootless arm64e)
-        id: build
+      # Resolve the frida version here and always pass an explicit tag to
+      # build-ios.sh. Anonymous api.github.com requests from the shared
+      # GitHub-hosted runner IPs are rate-limited (HTTP 403); the job token
+      # raises the limit, and git ls-remote is a fallback that does not touch
+      # the REST API at all.
+      # Output goes to build.log too, so a failure here still reaches the
+      # ci-status branch (see scripts/report-status.sh).
+      - name: Resolve Frida version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.frida_version }}
         run: |
           set -o pipefail
-          bash scripts/build-ios.sh "${{ github.event.inputs.frida_version }}" 2>&1 | tee build.log
+          {
+            ver="$(printf '%s' "${INPUT_VERSION:-}" | tr -d '[:space:]')"
+            if [ -z "$ver" ]; then
+              echo "[resolve] no version given, looking up latest frida release"
+              ver="$(gh api repos/frida/frida/releases/latest --jq .tag_name 2>/dev/null || true)"
+              # on an HTTP error gh prints the error body to stdout: accept only x.y.z
+              printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || ver=""
+            fi
+            if [ -z "$ver" ]; then
+              echo "::warning::GitHub API lookup failed, falling back to git ls-remote"
+              ver="$(git ls-remote --tags --refs https://github.com/frida/frida.git \
+                | sed 's#.*refs/tags/##' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -t. -k1,1n -k2,2n -k3,3n \
+                | tail -n1 || true)"
+            fi
+            if [ -z "$ver" ]; then
+              echo "::error::could not resolve frida version"
+              exit 1
+            fi
+            echo "[resolve] frida version to build: $ver"
+            echo "frida_version=$ver" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee -a build.log
+
+      - name: Build frida-server (iOS rootless arm64e)
+        id: build
+        env:
+          FRIDA_TAG: ${{ steps.ver.outputs.frida_version }}
+        run: |
+          set -o pipefail
+          bash scripts/build-ios.sh "$FRIDA_TAG" 2>&1 | tee -a build.log
 
       - name: Read frida version
         if: always()
@@ -81,12 +122,23 @@ jobs:
           tag="v${ver}"
           notes="release-notes.md"
           {
-            echo "Anti-detect frida-server for iOS - roothide Dopamine, rootless, arm64e."
+            echo "frida-server for iOS - roothide Dopamine / rootless, arm64e (fat arm64+arm64e)."
+            echo "Each release carries two flavors, each in two packagings."
             echo
             echo "- frida version: \`${ver}\`"
             echo "- built: $(date -u +%FT%TZ) in GitHub Actions (macos-14)"
             echo
-            echo "## Applied / skipped Florida patches"
+            echo "### Assets"
+            echo "| file | flavor | jailbreak layout |"
+            echo "|---|---|---|"
+            echo "| \`frida_${ver}_iphoneos-arm64e-roothide.deb\` | stealth (anti-detect) | roothide (jbroot) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e.deb\` | stealth (anti-detect) | rootless (\`/var/jb\`) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e-roothide-vanilla.deb\` | vanilla (upstream) | roothide (jbroot) |"
+            echo "| \`frida_${ver}_iphoneos-arm64e-vanilla.deb\` | vanilla (upstream) | rootless (\`/var/jb\`) |"
+            echo
+            echo "Vanilla = pristine upstream frida, no patches. Stealth = Florida + iOS anti-detect patches."
+            echo
+            echo "## Applied / skipped anti-detect patches (stealth builds only)"
             echo '```'
             cat patch-report.txt 2>/dev/null || echo "no patch report"
             echo '```'
@@ -96,7 +148,7 @@ jobs:
             gh release edit "$tag" --notes-file "$notes" --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" out/*.deb \
-              --title "frida-server stealth ${ver} (rootless arm64e)" \
+              --title "frida-server ${ver} (stealth + vanilla, arm64e)" \
               --notes-file "$notes" \
               --repo "$GITHUB_REPOSITORY"
           fi
