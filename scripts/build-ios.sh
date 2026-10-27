@@ -1,7 +1,26 @@
 #!/usr/bin/env bash
 #
-# Build anti-detect frida-server for iOS (roothide Dopamine, rootless, arm64e).
-# Runs on a macOS runner. Produces out/frida_<ver>_iphoneos-arm64e.deb
+# Build frida-server for iOS (roothide Dopamine, rootless, arm64e).
+# Runs on a macOS runner.
+#
+# Usage: build-ios.sh [frida-tag]
+#   The workflow always passes the tag (resolved in its "Resolve Frida version"
+#   step). Without it, the script looks up the latest frida release itself.
+#
+# This script builds TWO flavors from the same frida checkout and packages each
+# for both jailbreak layouts, so a release carries four .deb files:
+#
+#   stealth (Florida + iOS anti-detect patches):
+#     out/frida_<ver>_iphoneos-arm64e-roothide.deb          roothide (jbroot)
+#     out/frida_<ver>_iphoneos-arm64e.deb                   rootless (/var/jb)
+#
+#   vanilla (pristine upstream frida, NO patches):
+#     out/frida_<ver>_iphoneos-arm64e-roothide-vanilla.deb  roothide (jbroot)
+#     out/frida_<ver>_iphoneos-arm64e-vanilla.deb           rootless (/var/jb)
+#
+# The vanilla flavor is built FIRST from the pristine source; the anti-detect
+# patches are then applied and the stealth flavor is built. The stealth deb
+# names are unchanged from the original single-flavor build.
 #
 set -uo pipefail
 
@@ -12,11 +31,26 @@ log() { echo -e "\033[0;32m[build]\033[0m $*"; }
 err() { echo -e "\033[0;31m[build]\033[0m $*" >&2; }
 
 # --- resolve frida version ---------------------------------------------------
+# In CI the workflow resolves the version and always passes it as $1. The lookup
+# below is only for running the script by hand without an argument. Anonymous
+# api.github.com requests are rate-limited (HTTP 403 on shared IPs), so send
+# GH_TOKEN when set and fall back to git ls-remote, which needs no API at all.
 if [ -n "${INPUT_VERSION}" ]; then
   FRIDA_TAG="${INPUT_VERSION}"
 else
-  FRIDA_TAG="$(curl -fsSL https://api.github.com/repos/frida/frida/releases/latest \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')"
+  auth=()
+  [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+  # ${auth[@]+...} keeps an empty array safe under `set -u` on macOS bash 3.2
+  FRIDA_TAG="$(curl -fsSL ${auth[@]+"${auth[@]}"} https://api.github.com/repos/frida/frida/releases/latest 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || true)"
+  if [ -z "${FRIDA_TAG}" ]; then
+    log "GitHub API lookup failed, falling back to git ls-remote"
+    FRIDA_TAG="$(git ls-remote --tags --refs https://github.com/frida/frida.git \
+      | sed 's#.*refs/tags/##' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | tail -n1 || true)"
+  fi
 fi
 [ -z "${FRIDA_TAG}" ] && { err "could not resolve frida version"; exit 1; }
 log "Frida version to build: ${FRIDA_TAG}"
@@ -50,71 +84,93 @@ FRIDA_VERSION="$(echo "${FRIDA_VERSION}" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*
 export FRIDA_VERSION
 log "FRIDA_VERSION=${FRIDA_VERSION}"
 
-# --- apply Florida anti-detect patches ---------------------------------------
-bash "${WORK}/scripts/apply-patches.sh" "${WORK}/frida" "${WORK}/patch-report.txt" "${WORK}/patches-ios"
-
-# --- configure + build: ios-arm64e (fat arm64 + arm64e), installed assets ----
-# rootless prefix /var/jb/usr ; --host=ios-arm64e emits a fat arm64+arm64e binary.
-log "configuring (host=ios-arm64e, prefix=/var/jb/usr)"
-./configure \
-  --prefix=/var/jb/usr \
-  --host=ios-arm64e \
-  -- \
-  -Dfrida-core:assets=installed
-
-NPROC=$(( $(/usr/sbin/sysctl -n hw.logicalcpu) + 1 ))
-log "building with -j${NPROC}"
-gmake -j"${NPROC}"
-
-rm -rf "${WORK}/dist"
-DESTDIR="${WORK}/dist" gmake -j"${NPROC}" install
-
-# --- locate outputs ----------------------------------------------------------
-# frida 17.x installs the agent under lib/frida-1.0/ (older frida used lib/frida/).
-# Resolve both, with a find fallback so a future layout change does not break us.
-SERVER="${WORK}/dist/var/jb/usr/bin/frida-server"
-AGENT="${WORK}/dist/var/jb/usr/lib/frida-1.0/frida-agent.dylib"
-[ -f "${SERVER}" ] || SERVER="$(find "${WORK}/dist" -path '*/bin/frida-server' -type f | head -1)"
-[ -f "${AGENT}" ]  || AGENT="$(find "${WORK}/dist" -name 'frida-agent.dylib' -type f | head -1)"
-if [ -z "${SERVER}" ] || [ ! -f "${SERVER}" ]; then
-  err "frida-server not found under dist/"
-  find "${WORK}/dist" \( -name 'frida-server' -o -name 'frida-agent.dylib' \) | sed 's/^/  found: /'
-  exit 2
-fi
-if [ -z "${AGENT}" ] || [ ! -f "${AGENT}" ]; then
-  err "frida-agent.dylib not found under dist/"
-  find "${WORK}/dist" -name 'frida-agent.dylib' | sed 's/^/  found: /'
-  exit 2
-fi
-log "server: ${SERVER}"
-log "agent:  ${AGENT}"
-
-log "server slices: $(lipo -archs "${SERVER}" 2>/dev/null)"
-log "agent  slices: $(lipo -archs "${AGENT}" 2>/dev/null)"
-
-# --- codesign (adhoc, preserve entitlements) ---------------------------------
-codesign -vf -s "-" --preserve-metadata=entitlements --timestamp=none "${SERVER}"
-codesign -vf -s "-" --preserve-metadata=entitlements --timestamp=none "${AGENT}"
-log "codesign done"
-
-# --- package rootless .deb (iphoneos-arm64e, /var/jb) ------------------------
 mkdir -p "${WORK}/out"
-DEB="${WORK}/out/frida_${FRIDA_VERSION}_iphoneos-arm64e.deb"
-FRIDA_VERSION="${FRIDA_VERSION}" bash "${WORK}/tools/package-server-fruity.sh" \
-  "iphoneos-arm64e" \
-  "${WORK}/dist/var/jb" \
-  "${DEB}"
 
-# --- also package a roothide variant (no /var/jb, rootful layout) ------------
-DEB_ROOTHIDE="${WORK}/out/frida_${FRIDA_VERSION}_iphoneos-arm64e-roothide.deb"
-FRIDA_VERSION="${FRIDA_VERSION}" bash "${WORK}/tools/package-server-roothide.sh" \
-  "iphoneos-arm64e" \
-  "${WORK}/dist/var/jb" \
-  "${DEB_ROOTHIDE}"
+# --- build one flavor: configure + build + install + locate + codesign -------
+# usage: build_flavor <dist_dir>
+# Leaves a signed frida-server + frida-agent.dylib under <dist_dir>/var/jb/usr.
+build_flavor() {
+  local dist="$1"
+
+  # Always start from a clean meson build dir so patched (or pristine) sources
+  # are actually recompiled for this flavor.
+  rm -rf "${WORK}/frida/build"
+
+  log "configuring (host=ios-arm64e, prefix=/var/jb/usr)"
+  ./configure \
+    --prefix=/var/jb/usr \
+    --host=ios-arm64e \
+    -- \
+    -Dfrida-core:assets=installed
+
+  local nproc; nproc=$(( $(/usr/sbin/sysctl -n hw.logicalcpu) + 1 ))
+  log "building with -j${nproc}"
+  gmake -j"${nproc}"
+
+  rm -rf "${dist}"
+  DESTDIR="${dist}" gmake -j"${nproc}" install
+
+  # frida 17.x installs the agent under lib/frida-1.0/ (older frida used lib/frida/).
+  local server agent
+  server="${dist}/var/jb/usr/bin/frida-server"
+  agent="${dist}/var/jb/usr/lib/frida-1.0/frida-agent.dylib"
+  [ -f "${server}" ] || server="$(find "${dist}" -path '*/bin/frida-server' -type f | head -1)"
+  [ -f "${agent}" ]  || agent="$(find "${dist}" -name 'frida-agent.dylib' -type f | head -1)"
+  if [ -z "${server}" ] || [ ! -f "${server}" ]; then
+    err "frida-server not found under ${dist}"
+    find "${dist}" \( -name 'frida-server' -o -name 'frida-agent.dylib' \) | sed 's/^/  found: /'
+    exit 2
+  fi
+  if [ -z "${agent}" ] || [ ! -f "${agent}" ]; then
+    err "frida-agent.dylib not found under ${dist}"
+    find "${dist}" -name 'frida-agent.dylib' | sed 's/^/  found: /'
+    exit 2
+  fi
+  log "server: ${server}"
+  log "agent:  ${agent}"
+  log "server slices: $(lipo -archs "${server}" 2>/dev/null)"
+  log "agent  slices: $(lipo -archs "${agent}" 2>/dev/null)"
+
+  codesign -vf -s "-" --preserve-metadata=entitlements --timestamp=none "${server}"
+  codesign -vf -s "-" --preserve-metadata=entitlements --timestamp=none "${agent}"
+  log "codesign done"
+}
+
+# --- package one flavor into rootless + roothide debs ------------------------
+# usage: package_flavor <dist_dir> <suffix>
+# suffix "" -> stealth (original names) ; "-vanilla" -> vanilla flavor.
+package_flavor() {
+  local dist="$1" suffix="$2"
+  local deb_rootless="${WORK}/out/frida_${FRIDA_VERSION}_iphoneos-arm64e${suffix}.deb"
+  local deb_roothide="${WORK}/out/frida_${FRIDA_VERSION}_iphoneos-arm64e-roothide${suffix}.deb"
+
+  FRIDA_VERSION="${FRIDA_VERSION}" bash "${WORK}/tools/package-server-fruity.sh" \
+    "iphoneos-arm64e" "${dist}/var/jb" "${deb_rootless}"
+  FRIDA_VERSION="${FRIDA_VERSION}" bash "${WORK}/tools/package-server-roothide.sh" \
+    "iphoneos-arm64e" "${dist}/var/jb" "${deb_roothide}"
+
+  log "packaged (rootless /var/jb): ${deb_rootless}"
+  log "packaged (roothide):         ${deb_roothide}"
+}
+
+# === flavor 1: VANILLA (pristine upstream source, no patches) ================
+log "=== building VANILLA (no anti-detect patches) ==="
+build_flavor "${WORK}/dist-vanilla"
+package_flavor "${WORK}/dist-vanilla" "-vanilla"
+# free the big build/install trees before the second compile
+rm -rf "${WORK}/dist-vanilla" "${WORK}/frida/build"
+
+# === flavor 2: STEALTH (Florida + iOS anti-detect patches) ===================
+log "=== building STEALTH (Florida + iOS anti-detect patches) ==="
+bash "${WORK}/scripts/apply-patches.sh" "${WORK}/frida" "${WORK}/patch-report.txt" "${WORK}/patches-ios"
+build_flavor "${WORK}/dist-stealth"
+package_flavor "${WORK}/dist-stealth" ""
 
 echo "${FRIDA_VERSION}" > "${WORK}/out/FRIDA_VERSION.txt"
-log "packaged (rootless /var/jb): ${DEB}"
-log "packaged (roothide):         ${DEB_ROOTHIDE}"
+log "=== all packages ==="
 ls -la "${WORK}/out"
-echo "=== rootless deb ==="; dpkg-deb -I "${DEB}" || true; dpkg-deb -c "${DEB}" || true
-echo "=== roothide deb ==="; dpkg-deb -I "${DEB_ROOTHIDE}" || true; dpkg-deb -c "${DEB_ROOTHIDE}" || true
+for d in "${WORK}/out"/*.deb; do
+  echo "=== ${d} ==="
+  dpkg-deb -I "${d}" || true
+  dpkg-deb -c "${d}" || true
+done
